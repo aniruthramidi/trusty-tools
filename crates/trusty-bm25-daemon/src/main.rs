@@ -1,4 +1,4 @@
-//! Per-palace BM25 lexical-search subprocess (issue #156).
+//! Per-palace BM25 lexical-search subprocess binary (issue #156).
 //!
 //! Why: trusty-memory's recall path lacked a lexical lane — only vector
 //! similarity. For short, identifier-heavy queries ("cargo test",
@@ -8,47 +8,38 @@
 //! gives each palace its own writer (the subprocess IS the lock) and mirrors
 //! the `trusty-embed-daemon` architecture (PR #157).
 //!
-//! What: a small Tokio binary that
-//!   1. parses CLI flags (--palace, --data-dir, --socket, --write-window-ms,
-//!      --max-batch-size, --verbose),
-//!   2. initialises tracing on stderr,
-//!   3. loads (or creates) the `PalaceBm25Index` snapshot from `data_dir`,
-//!   4. spawns the `BatchQueue` worker,
-//!   5. cleans up any stale socket file, binds the `UnixListener`,
-//!   6. runs the accept loop alongside a SIGTERM/SIGINT shutdown handler,
-//!   7. removes the socket file on clean exit.
+//! What: this binary is now a thin shell — it parses CLI flags with `clap`,
+//! initialises tracing on stderr, builds a [`trusty_bm25_daemon::DaemonConfig`],
+//! and hands control to [`trusty_bm25_daemon::run`]. All startup logic
+//! (snapshot load, batch-queue worker, UDS bind, accept loop, signal-driven
+//! shutdown) lives in the library half of this crate so embedders can reuse
+//! it without spawning a subprocess.
 //!
-//! Test: unit coverage in `protocol.rs`, `socket.rs`, `index.rs`, `batch_queue.rs`,
-//! and `server.rs`. End-to-end coverage in `tests/bm25_daemon.rs`.
+//! Test: per-module unit tests live in the library half (`src/{batch_queue,
+//! index, protocol, server, socket}.rs`); end-to-end coverage in
+//! `tests/bm25_daemon.rs`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use tokio::signal::unix::{signal, SignalKind};
 
-mod batch_queue;
-mod index;
-mod protocol;
-mod server;
-mod socket;
-
-use batch_queue::{BatchConfig, BatchQueue, DEFAULT_MAX_BATCH_SIZE, DEFAULT_WRITE_WINDOW_MS};
-use index::PalaceBm25Index;
+use trusty_bm25_daemon::batch_queue::{DEFAULT_MAX_BATCH_SIZE, DEFAULT_WRITE_WINDOW_MS};
+use trusty_bm25_daemon::{run, DaemonConfig};
 
 /// CLI flags for the BM25 daemon.
 ///
 /// Why: operators (and parent processes like trusty-memory's subprocess
 /// spawner) configure the daemon by passing flags. Keeping the surface small
-/// matches the daemon's single responsibility.
+/// matches the daemon's single responsibility. The struct exists solely to
+/// translate CLI args into a [`DaemonConfig`] — the library entry-point is
+/// the canonical configuration shape.
 /// What: palace name (determines the default socket path), data directory
 /// (where the snapshot lives), optional socket override, batch-tuning knobs,
 /// and verbosity. All have documented defaults from the batch_queue / socket
 /// constants.
 /// Test: covered indirectly by the integration test which constructs custom
-/// palace / data-dir / socket arguments.
+/// palace / data-dir / socket arguments via the library entry-point.
 #[derive(Debug, Parser)]
 #[command(
     name = "trusty-bm25-daemon",
@@ -90,71 +81,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     trusty_common::init_tracing(cli.verbose);
 
-    let socket_path = cli
-        .socket
-        .unwrap_or_else(|| socket::default_socket_path(&cli.palace));
-
-    let config = BatchConfig {
-        max_batch_size: cli.max_batch_size.max(1),
-        write_window: Duration::from_millis(cli.write_window_ms),
+    let config = DaemonConfig {
+        palace: cli.palace,
+        data_dir: cli.data_dir,
+        socket: cli.socket,
+        write_window_ms: cli.write_window_ms,
+        max_batch_size: cli.max_batch_size,
     };
 
-    tracing::info!(
-        palace = %cli.palace,
-        data_dir = %cli.data_dir.display(),
-        socket = %socket_path.display(),
-        max_batch_size = config.max_batch_size,
-        write_window_ms = config.write_window.as_millis(),
-        "trusty-bm25-daemon starting"
-    );
-
-    // Step 1: load (or create) the palace BM25 snapshot. This validates the
-    // data-dir exists and is writable before we bind the socket.
-    let palace_index = PalaceBm25Index::load_or_create(&cli.data_dir)
-        .with_context(|| format!("load BM25 palace index from {}", cli.data_dir.display()))?;
-
-    // Step 2: spawn the batch-queue worker. The worker takes ownership of
-    // the index and is the sole writer for the rest of the daemon's lifetime.
-    let queue = Arc::new(BatchQueue::new(palace_index, config));
-
-    // Step 3: ensure the socket's parent directory exists, then clean up any
-    // leftover socket file from a prior crash.
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create socket directory {}", parent.display()))?;
-    }
-    socket::cleanup_stale_socket(&socket_path);
-
-    // Step 4: bind the UDS listener.
-    let listener = server::bind_listener(&socket_path)
-        .with_context(|| format!("bind bm25 daemon socket at {}", socket_path.display()))?;
-    tracing::info!(
-        palace = %cli.palace,
-        socket = %socket_path.display(),
-        "trusty-bm25-daemon ready"
-    );
-
-    // Step 5: run the accept loop alongside a signal-driven shutdown.
-    let accept = tokio::spawn(server::run_accept_loop(listener, queue));
-
-    let mut sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
-    let mut sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
-
-    tokio::select! {
-        _ = sigterm.recv() => {
-            tracing::info!("received SIGTERM — shutting down");
-        }
-        _ = sigint.recv() => {
-            tracing::info!("received SIGINT — shutting down");
-        }
-        _ = accept => {
-            // The accept loop never returns in normal operation.
-            tracing::warn!("accept loop exited unexpectedly");
-        }
-    }
-
-    // Step 6: remove the socket file on clean exit so the next run does not
-    // see EADDRINUSE.
-    socket::cleanup_stale_socket(&socket_path);
-    Ok(())
+    run(config).await
 }

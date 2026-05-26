@@ -12,6 +12,10 @@ homepage = "https://github.com/bobmatnyc/trusty-tools"
 keywords = ["mcp", "bm25", "search", "daemon"]
 categories = ["command-line-utilities"]
 
+[lib]
+name = "trusty_bm25_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "trusty-bm25-daemon"
 path = "src/main.rs"
